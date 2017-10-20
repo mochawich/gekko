@@ -75,14 +75,15 @@ var Indicators = {
 var allowedIndicators = _.keys(Indicators);
 var allowedTalibIndicators = _.keys(talib);
 
-var Base = function() {
+var Base = function(settings) {
   _.bindAll(this);
 
   // properties
   this.age = 0;
   this.processedTicks = 0;
   this.setup = false;
-
+  this.settings = settings;
+  this.tradingAdvisor = config.tradingAdvisor;
   // defaults
   this.requiredHistory = 0;
   this.priceValue = 'close';
@@ -90,6 +91,7 @@ var Base = function() {
   this.talibIndicators = {};
   this.asyncTick = false;
   this.candlePropsCacheSize = 1000;
+  this.deferredTicks = [];
 
   this._prevAdvice;
 
@@ -98,7 +100,9 @@ var Base = function() {
     high: [],
     low: [],
     close: [],
-    volume: []
+    volume: [],
+    vwp: [],
+    trades: []
   };
 
   // make sure we have all methods
@@ -110,6 +114,9 @@ var Base = function() {
   if(!this.update)
     this.update = function() {};
 
+  if(!this.end)
+    this.end = function() {};
+
   // let's run the implemented starting point
   this.init();
 
@@ -120,14 +127,31 @@ var Base = function() {
 
   if(_.size(this.talibIndicators))
     this.asyncTick = true;
+
+  if(_.size(this.indicators))
+    this.hasSyncIndicators = true;
 }
 
 // teach our base trading method events
 util.makeEventEmitter(Base);
 
 Base.prototype.tick = function(candle) {
+
+  if(
+    this.asyncTick &&
+    this.hasSyncIndicators &&
+    this.age !== this.processedTicks
+  ) {
+    // Gekko will call talib and run strat
+    // functions when talib is done, but by
+    // this time the sync indicators might be
+    // updated with future candles.
+    //
+    // See @link: https://github.com/askmike/gekko/issues/837#issuecomment-316549691
+    return this.deferredTicks.push(candle);
+  }
+
   this.age++;
-  this.candle = candle;
 
   if(this.asyncTick) {
     this.candleProps.open.push(candle.open);
@@ -135,6 +159,8 @@ Base.prototype.tick = function(candle) {
     this.candleProps.low.push(candle.low);
     this.candleProps.close.push(candle.close);
     this.candleProps.volume.push(candle.volume);
+    this.candleProps.vwp.push(candle.vwp);
+    this.candleProps.trades.push(candle.trades);
 
     if(this.age > this.candlePropsCacheSize) {
       this.candleProps.open.shift();
@@ -142,6 +168,8 @@ Base.prototype.tick = function(candle) {
       this.candleProps.low.shift();
       this.candleProps.close.shift();
       this.candleProps.volume.shift();
+      this.candleProps.vwp.shift();
+      this.candleProps.trades.shift();
     }
   }
 
@@ -155,12 +183,13 @@ Base.prototype.tick = function(candle) {
   },this);
 
   // update the trading method
-  if(!this.asyncTick || this.requiredHistory > this.age) {
+  if(!this.asyncTick) {
     this.propogateTick(candle);
   } else {
+
     var next = _.after(
       _.size(this.talibIndicators),
-      this.propogateTick
+      () => this.propogateTick(candle)
     );
 
     var basectx = this;
@@ -185,9 +214,6 @@ Base.prototype.tick = function(candle) {
     );
   }
 
-  // update previous price
-  this.lastPrice = price;
-
   this.propogateCustomCandle(candle);
 }
 
@@ -205,6 +231,8 @@ if(ENV !== 'child-process') {
 }
 
 Base.prototype.propogateTick = function(candle) {
+  this.candle = candle;
+
   this.update(candle);
 
   var isAllowedToCheck = this.requiredHistory <= this.age;
@@ -223,6 +251,14 @@ Base.prototype.propogateTick = function(candle) {
     this.check(candle);
   }
   this.processedTicks++;
+
+  if(
+    this.asyncTick &&
+    this.hasSyncIndicators &&
+    this.deferredTicks.length
+  ) {
+    return this.tick(this.deferredTicks.shift())
+  }
 
   // are we totally finished?
   var done = this.age === this.processedTicks;
@@ -261,7 +297,7 @@ Base.prototype.addIndicator = function(name, type, parameters) {
   this.indicators[name].input = Indicators[type].input;
 }
 
-Base.prototype.advice = function(newPosition) {
+Base.prototype.advice = function(newPosition, _candle) {
   // ignore soft advice coming from legacy
   // strategies.
   if(!newPosition)
@@ -271,13 +307,19 @@ Base.prototype.advice = function(newPosition) {
   if(newPosition === this._prevAdvice)
     return;
 
+  // cache the candle this advice is based on
+  if(_candle)
+    var candle = _candle;
+  else
+    var candle = this.candle;
+
   this._prevAdvice = newPosition;
 
   _.defer(function() {
     this.emit('advice', {
       recommendation: newPosition,
       portfolio: 1,
-      candle: this.candle
+      candle
     });
   }.bind(this));
 }
@@ -286,11 +328,15 @@ Base.prototype.advice = function(newPosition) {
 // to be sure we only stop after all candles are
 // processed.
 Base.prototype.finish = function(done) {
-  if(!this.asyncTick)
+  if(!this.asyncTick) {
+    this.end();
     return done();
+  }
 
-  if(this.age === this.processedTicks)
+  if(this.age === this.processedTicks) {
+    this.end();
     return done();
+  }
 
   // we are not done, register cb
   // and call after we are..
